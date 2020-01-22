@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cache_2q::Cache;
-use std::sync::Mutex;
 
 #[derive(Debug, PartialEq)]
 pub enum DivisionSep {
@@ -136,23 +135,18 @@ named!( ps_line<&str, Rule>,
 /// List provides domain parsing capabilities
 pub struct List {
     sections: HashMap<String, Vec<Rule>>,
-    cache: Mutex<Cache<String, usize>>,
-    cache_len: AtomicUsize,
+    cache: Cache<String, usize>
 }
 
 impl List {
     /// expire internal cache
-    pub fn clear_cache(&self) {
-        self.cache.lock().unwrap().clear()
-    }
-
-    pub fn cache_len(&self) -> usize {
-        self.cache_len.load(Ordering::SeqCst)
+    pub fn clear_cache(&mut self) {
+        self.cache.clear()
     }
 
     /// parse_domain parses a tld+1 from a domain
-    pub fn parse_domain<'a>(&self, raw_input: &'a str) -> Option<&'a str> {
-        if let Some(dlen) = self.cache.lock().unwrap().get(raw_input) {
+    pub fn parse_domain<'a>(&mut self, raw_input: &'a str) -> Option<&'a str> {
+        if let Some(dlen) = self.cache.get(raw_input) {
             if *dlen < raw_input.len() {
                 return Some(&raw_input[*dlen..]);
             }
@@ -170,7 +164,7 @@ impl List {
         let input_tokens_len = input_tokens.len();
 
         // 1 Match domain against all rules and take note of the matching ones.
-        let mut matches = Vec::with_capacity(10);
+        let mut matches = Vec::with_capacity(100);
 
         // 2 If no rules match, the prevailing rule is "*".
         // 3 If more than one rule matches, the prevailing rule is the one which is an exception rule.
@@ -272,9 +266,7 @@ impl List {
         if let Some(domain_token) = input_tokens.get(domain_idx) {
             let dlen = raw_input.len() - domain_token.len() - 1 - rule_chars_len;
             if dlen < raw_input.len() {
-                let mut cache = self.cache.lock().unwrap();
-                cache.entry(raw_input.to_string()).or_insert(dlen);
-                self.cache_len.store(cache.len(), Ordering::SeqCst);
+                self.cache.entry(raw_input.to_string()).or_insert(dlen);
                 return Some(&raw_input[dlen..]);
             }
         }
@@ -336,8 +328,7 @@ impl List {
 
         List {
             sections,
-            cache: Mutex::new(Cache::new(cache_size)),
-            cache_len: AtomicUsize::new(0),
+            cache: Cache::new(cache_size)
         }
     }
 }
