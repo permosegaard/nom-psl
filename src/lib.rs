@@ -1,10 +1,6 @@
 #[macro_use]
 extern crate nom;
 
-#[cfg(test)]
-#[macro_use]
-extern crate lazy_static;
-
 #[macro_use]
 extern crate log;
 
@@ -13,7 +9,6 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cache_2q::Cache;
 
@@ -286,20 +281,26 @@ impl List {
 
     /// PUBLIC_SUFFIX_LIST_FILE="some/path/to/file.txt"
     /// parse_source_file Will prefer the env variable to the passed &str path
-    pub fn parse_source_file(filename: &str, cache_size: usize) -> io::Result<Self> {
+    pub fn parse_source_file(filename: &str, cache_size: usize, include_private: bool) -> io::Result<Self> {
         let psl_path = env::var("PUBLIC_SUFFIX_LIST_FILE").unwrap_or_else(|_| filename.to_string());
 
         let path = fs::canonicalize(PathBuf::from(psl_path))?;
         info!("Using public suffix list file: {:?}", path);
 
         let contents = Self::read_file(&path)?;
-        Ok(Self::parse_source(contents, cache_size))
+        Ok(Self::parse_source(contents, cache_size, include_private))
     }
 
-    fn parse_source(source: String, cache_size: usize) -> Self {
+    fn parse_source(source: String, cache_size: usize, include_private: bool) -> Self {
         let mut sections: HashMap<String, Vec<Rule>> = HashMap::new();
         let mut rest: &str = &source;
+        let mut skip_private = false;
         while let Ok((r, rule)) = ps_line(rest) {
+            if skip_private { continue; }
+
+            if rule == Rule::Division(Division::PRIVATE(DivisionSep::Begin)) && !include_private { skip_private = true; }
+            else if rule == Rule::Division(Division::PRIVATE(DivisionSep::End)) && !include_private { skip_private= false; }
+
             rest = r;
             if let Rule::Suffix(s, ty) = rule {
                 let section = s.first().unwrap();
@@ -340,7 +341,7 @@ mod tests {
     #[test]
     fn test_parse_domain() {
         let example = "am\ncom.am\n!gov.am\n*.net.am\n";
-        let list = List::parse_source(example.to_string(), 10);
+        let mut list = List::parse_source(example.to_string(), 10, true);
         let domain = "sub.example.com.am";
 
         let parsed_domain = list.parse_domain(domain);
@@ -351,7 +352,7 @@ mod tests {
     #[test]
     fn test_parse_list() {
         let example = "am\ncom.am\n!gov.am\n*.com.am\n";
-        let parsed = List::parse_source(example.to_string(), 10);
+        let parsed = List::parse_source(example.to_string(), 10, true);
         assert_eq!(
             parsed.sections.get("am"),
             Some(&vec![
@@ -436,128 +437,123 @@ mod tests {
         );
     }
 
-    lazy_static! {
-        static ref LIST: List = {
-            let list = List::parse_source_file("public_suffix_list.dat", 10);
-            list.expect("unable to parse PSL file")
-        };
-    }
-
     #[test]
     fn comodo_suite() {
+        let mut list = List::parse_source_file("public_suffix_list.dat", 10, true).expect("unable to parse PSL file");
+
         // Any copyright is dedicated to the Public Domain.
         // https://creativecommons.org/publicdomain/zero/1.0/
         // null input.
-        check_public_suffix("", "");
+        check_public_suffix(&mut list, "", "");
         // Mixed case.
 
         // NOTE: is one place where we should choose to deviate from the spec:
         // requiring a to_lowercase() call results in an allocation.
-        //check_public_suffix("COM", "");
-        //check_public_suffix("example.COM", "example.com");
-        //check_public_suffix("WwW.example.COM", "example.com");
+        //check_public_suffix(&mut list, "COM", "");
+        //check_public_suffix(&mut list, "example.COM", "example.com");
+        //check_public_suffix(&mut list, "WwW.example.COM", "example.com");
 
         // Leading dot.
-        check_public_suffix(".com", "");
-        check_public_suffix(".example", "");
-        check_public_suffix(".example.com", "");
-        check_public_suffix(".example.example", "");
+        check_public_suffix(&mut list, ".com", "");
+        check_public_suffix(&mut list, ".example", "");
+        check_public_suffix(&mut list, ".example.com", "");
+        check_public_suffix(&mut list, ".example.example", "");
         // Unlisted TLD.
-        check_public_suffix("example", "");
-        check_public_suffix("example.example", "example.example");
-        check_public_suffix("b.example.example", "example.example");
-        check_public_suffix("a.b.example.example", "example.example");
+        check_public_suffix(&mut list, "example", "");
+        check_public_suffix(&mut list, "example.example", "example.example");
+        check_public_suffix(&mut list, "b.example.example", "example.example");
+        check_public_suffix(&mut list, "a.b.example.example", "example.example");
 
         // Listed, but non-Internet, TLD.
-        //check_public_suffix("local', "");
-        //check_public_suffix("example.local', "");
-        //check_public_suffix("b.example.local', "");
-        //check_public_suffix("a.b.example.local', "");
+        //check_public_suffix(&mut list, "local', "");
+        //check_public_suffix(&mut list, "example.local', "");
+        //check_public_suffix(&mut list, "b.example.local', "");
+        //check_public_suffix(&mut list, "a.b.example.local', "");
         // TLD with only 1 rule.
-        check_public_suffix("biz", "");
-        check_public_suffix("domain.biz", "domain.biz");
-        check_public_suffix("b.domain.biz", "domain.biz");
-        check_public_suffix("a.b.domain.biz", "domain.biz");
+        check_public_suffix(&mut list, "biz", "");
+        check_public_suffix(&mut list, "domain.biz", "domain.biz");
+        check_public_suffix(&mut list, "b.domain.biz", "domain.biz");
+        check_public_suffix(&mut list, "a.b.domain.biz", "domain.biz");
         // TLD with some 2-level rules.
-        check_public_suffix("com", "");
-        check_public_suffix("example.com", "example.com");
-        check_public_suffix("b.example.com", "example.com");
-        check_public_suffix("a.b.example.com", "example.com");
-        check_public_suffix("uk.com", "");
-        check_public_suffix("example.uk.com", "example.uk.com");
-        check_public_suffix("b.example.uk.com", "example.uk.com");
-        check_public_suffix("a.b.example.uk.com", "example.uk.com");
-        check_public_suffix("test.ac", "test.ac");
+        check_public_suffix(&mut list, "com", "");
+        check_public_suffix(&mut list, "example.com", "example.com");
+        check_public_suffix(&mut list, "b.example.com", "example.com");
+        check_public_suffix(&mut list, "a.b.example.com", "example.com");
+        check_public_suffix(&mut list, "uk.com", "");
+        check_public_suffix(&mut list, "example.uk.com", "example.uk.com");
+        check_public_suffix(&mut list, "b.example.uk.com", "example.uk.com");
+        check_public_suffix(&mut list, "a.b.example.uk.com", "example.uk.com");
+        check_public_suffix(&mut list, "test.ac", "test.ac");
         // TLD with only 1 (wildcard) rule.
-        check_public_suffix("mm", "");
+        check_public_suffix(&mut list, "mm", "");
 
         //NOTE, not present in file!
-        check_public_suffix("c.mm", "");
-        check_public_suffix("b.c.mm", "b.c.mm");
-        check_public_suffix("a.b.c.mm", "b.c.mm");
+        check_public_suffix(&mut list, "c.mm", "");
+        check_public_suffix(&mut list, "b.c.mm", "b.c.mm");
+        check_public_suffix(&mut list, "a.b.c.mm", "b.c.mm");
 
         // More complex TLD.
-        check_public_suffix("jp", "");
-        check_public_suffix("test.jp", "test.jp");
-        check_public_suffix("www.test.jp", "test.jp");
-        check_public_suffix("ac.jp", "");
-        check_public_suffix("test.ac.jp", "test.ac.jp");
-        check_public_suffix("www.test.ac.jp", "test.ac.jp");
-        check_public_suffix("kyoto.jp", "");
-        check_public_suffix("test.kyoto.jp", "test.kyoto.jp");
-        check_public_suffix("ide.kyoto.jp", "");
-        check_public_suffix("b.ide.kyoto.jp", "b.ide.kyoto.jp");
-        check_public_suffix("a.b.ide.kyoto.jp", "b.ide.kyoto.jp");
+        check_public_suffix(&mut list, "jp", "");
+        check_public_suffix(&mut list, "test.jp", "test.jp");
+        check_public_suffix(&mut list, "www.test.jp", "test.jp");
+        check_public_suffix(&mut list, "ac.jp", "");
+        check_public_suffix(&mut list, "test.ac.jp", "test.ac.jp");
+        check_public_suffix(&mut list, "www.test.ac.jp", "test.ac.jp");
+        check_public_suffix(&mut list, "kyoto.jp", "");
+        check_public_suffix(&mut list, "test.kyoto.jp", "test.kyoto.jp");
+        check_public_suffix(&mut list, "ide.kyoto.jp", "");
+        check_public_suffix(&mut list, "b.ide.kyoto.jp", "b.ide.kyoto.jp");
+        check_public_suffix(&mut list, "a.b.ide.kyoto.jp", "b.ide.kyoto.jp");
 
         // NOTE FAILS: why?
-        check_public_suffix("c.kobe.jp", "");
+        check_public_suffix(&mut list, "c.kobe.jp", "");
 
-        check_public_suffix("b.c.kobe.jp", "b.c.kobe.jp");
-        check_public_suffix("a.b.c.kobe.jp", "b.c.kobe.jp");
-        check_public_suffix("city.kobe.jp", "city.kobe.jp");
-        check_public_suffix("www.city.kobe.jp", "city.kobe.jp");
+        check_public_suffix(&mut list, "b.c.kobe.jp", "b.c.kobe.jp");
+        check_public_suffix(&mut list, "a.b.c.kobe.jp", "b.c.kobe.jp");
+        check_public_suffix(&mut list, "city.kobe.jp", "city.kobe.jp");
+        check_public_suffix(&mut list, "www.city.kobe.jp", "city.kobe.jp");
         // TLD with a wildcard rule and exceptions.
-        check_public_suffix("ck", "");
-        check_public_suffix("test.ck", "");
-        check_public_suffix("b.test.ck", "b.test.ck");
-        check_public_suffix("a.b.test.ck", "b.test.ck");
-        check_public_suffix("www.ck", "www.ck");
-        check_public_suffix("www.www.ck", "www.ck");
+        check_public_suffix(&mut list, "ck", "");
+        check_public_suffix(&mut list, "test.ck", "");
+        check_public_suffix(&mut list, "b.test.ck", "b.test.ck");
+        check_public_suffix(&mut list, "a.b.test.ck", "b.test.ck");
+        check_public_suffix(&mut list, "www.ck", "www.ck");
+        check_public_suffix(&mut list, "www.www.ck", "www.ck");
         // US K12.
-        check_public_suffix("us", "");
-        check_public_suffix("test.us", "test.us");
-        check_public_suffix("www.test.us", "test.us");
-        check_public_suffix("ak.us", "");
-        check_public_suffix("test.ak.us", "test.ak.us");
-        check_public_suffix("www.test.ak.us", "test.ak.us");
-        check_public_suffix("k12.ak.us", "");
-        check_public_suffix("test.k12.ak.us", "test.k12.ak.us");
-        check_public_suffix("www.test.k12.ak.us", "test.k12.ak.us");
+        check_public_suffix(&mut list, "us", "");
+        check_public_suffix(&mut list, "test.us", "test.us");
+        check_public_suffix(&mut list, "www.test.us", "test.us");
+        check_public_suffix(&mut list, "ak.us", "");
+        check_public_suffix(&mut list, "test.ak.us", "test.ak.us");
+        check_public_suffix(&mut list, "www.test.ak.us", "test.ak.us");
+        check_public_suffix(&mut list, "k12.ak.us", "");
+        check_public_suffix(&mut list, "test.k12.ak.us", "test.k12.ak.us");
+        check_public_suffix(&mut list, "www.test.k12.ak.us", "test.k12.ak.us");
         // IDN labels.
-        check_public_suffix("食狮.com.cn", "食狮.com.cn");
-        check_public_suffix("食狮.公司.cn", "食狮.公司.cn");
-        check_public_suffix("www.食狮.公司.cn", "食狮.公司.cn");
-        check_public_suffix("shishi.公司.cn", "shishi.公司.cn");
-        check_public_suffix("公司.cn", "");
-        check_public_suffix("食狮.中国", "食狮.中国");
-        check_public_suffix("www.食狮.中国", "食狮.中国");
-        check_public_suffix("shishi.中国", "shishi.中国");
-        check_public_suffix("中国", "");
+        check_public_suffix(&mut list, "食狮.com.cn", "食狮.com.cn");
+        check_public_suffix(&mut list, "食狮.公司.cn", "食狮.公司.cn");
+        check_public_suffix(&mut list, "www.食狮.公司.cn", "食狮.公司.cn");
+        check_public_suffix(&mut list, "shishi.公司.cn", "shishi.公司.cn");
+        check_public_suffix(&mut list, "公司.cn", "");
+        check_public_suffix(&mut list, "食狮.中国", "食狮.中国");
+        check_public_suffix(&mut list, "www.食狮.中国", "食狮.中国");
+        check_public_suffix(&mut list, "shishi.中国", "shishi.中国");
+        check_public_suffix(&mut list, "中国", "");
         // Same as above, but punycoded.
-        check_public_suffix("xn--85x722f.com.cn", "xn--85x722f.com.cn");
-        check_public_suffix("xn--85x722f.xn--55qx5d.cn", "xn--85x722f.xn--55qx5d.cn");
-        check_public_suffix("www.xn--85x722f.xn--55qx5d.cn", "xn--85x722f.xn--55qx5d.cn");
-        check_public_suffix("shishi.xn--55qx5d.cn", "shishi.xn--55qx5d.cn");
-        check_public_suffix("xn--55qx5d.cn", "");
-        check_public_suffix("xn--85x722f.xn--fiqs8s", "xn--85x722f.xn--fiqs8s");
-        check_public_suffix("www.xn--85x722f.xn--fiqs8s", "xn--85x722f.xn--fiqs8s");
-        check_public_suffix("shishi.xn--fiqs8s", "shishi.xn--fiqs8s");
-        check_public_suffix("xn--fiqs8s", "");
+        check_public_suffix(&mut list, "xn--85x722f.com.cn", "xn--85x722f.com.cn");
+        check_public_suffix(&mut list, "xn--85x722f.xn--55qx5d.cn", "xn--85x722f.xn--55qx5d.cn");
+        check_public_suffix(&mut list, "www.xn--85x722f.xn--55qx5d.cn", "xn--85x722f.xn--55qx5d.cn");
+        check_public_suffix(&mut list, "shishi.xn--55qx5d.cn", "shishi.xn--55qx5d.cn");
+        check_public_suffix(&mut list, "xn--55qx5d.cn", "");
+        check_public_suffix(&mut list, "xn--85x722f.xn--fiqs8s", "xn--85x722f.xn--fiqs8s");
+        check_public_suffix(&mut list, "www.xn--85x722f.xn--fiqs8s", "xn--85x722f.xn--fiqs8s");
+        check_public_suffix(&mut list, "shishi.xn--fiqs8s", "shishi.xn--fiqs8s");
+        check_public_suffix(&mut list, "xn--fiqs8s", "");
     }
 
-    fn check_public_suffix(input: &str, expected: &str) {
+    fn check_public_suffix(list: &mut List, input: &str, expected: &str) {
         let expected = if expected == "" { None } else { Some(expected) };
-        assert_eq!(LIST.parse_domain(input), expected);
+        assert_eq!(list.parse_domain(input), expected);
     }
 
 }
